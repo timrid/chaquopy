@@ -35,6 +35,7 @@ internal class TaskBuilder(
         srcTask = createSrcTask()
         reqsTask = createReqsTask()
         createProxyTask()
+        createStubsTask()
         createAssetsTasks()
         createJniLibsTasks()
     }
@@ -83,6 +84,17 @@ internal class TaskBuilder(
                         into(sitePackages)
                     }
                     project.delete(zipPath)
+
+                    // Install JPype1 for chaquopy_stubgen (C extension, can't be
+                    // bundled in build-packages.zip). Install directly into the venv's
+                    // site-packages using --target, since the venv has no pip
+                    // (--without-pip above).
+                    exec {
+                        commandLine(bpInfo.commandLine)
+                        args("-m", "pip", "install", "--quiet",
+                             "--target", sitePackages,
+                             "JPype1")
+                    }
 
                     // Pre-generate the __pycache__ directories to avoid the outputDir
                     // contents changing and breaking the up to date checks.
@@ -311,6 +323,84 @@ internal class TaskBuilder(
                 if (!python.staticProxy.isEmpty()) {
                     execBuildPython(args)
                 }
+            }
+        }
+    }
+
+    fun createStubsTask(): TaskProvider<StubsTask> {
+        val compileClasspath = project.configurations
+            .getByName("${variant.name}CompileClasspath")
+
+        val variantCap = variant.name.capitalize()
+        val javaCompileTaskName = "compile${variantCap}JavaWithJavac"
+        val kotlinCompileTaskName = "compile${variantCap}Kotlin"
+
+        return registerTask("generate", "stubs", StubsTask::class) {
+            inputs.files(compileClasspath)
+
+            // Wire Java compile output as input: creates task dependency + up-to-date tracking.
+            // Safe to call in afterEvaluate since AGP registers these tasks there.
+            inputs.files(project.tasks.named(javaCompileTaskName).map { it.outputs.files })
+
+            // Kotlin compile task is optional (pure-Java projects don't have it).
+            // Use project.tasks.names to check existence without realizing any task.
+            if (kotlinCompileTaskName in project.tasks.names) {
+                inputs.files(project.tasks.named(kotlinCompileTaskName).map { it.outputs.files })
+            }
+
+            // Write directly into the pip common directory so that stubs are picked up
+            // alongside pip-installed packages at runtime.
+            outputDir.set(plugin.buildSubdir("pip", variant).resolve(Common.ABI_COMMON))
+
+            doLast {
+                val classpathArgs = ArrayList<String>()
+
+                // 1. Dependency JARs/AARs from compileClasspath
+                val artifacts = compileClasspath.resolvedConfiguration.resolvedArtifacts
+                    .sortedBy { "${it.moduleVersion.id.group}:${it.name}" }
+                for (art in artifacts) {
+                    classpathArgs.add(art.file.absolutePath)
+                }
+
+                // 2. android.jar – not a Maven artifact; AGP adds it directly to the
+                // compiler without going through the Gradle compileClasspath configuration.
+                // Locate it using AGP's SdkComponents API + the project's compileSdk setting.
+                val sdkDir = project.extensions
+                    .getByType(AndroidComponentsExtension::class).sdkComponents
+                    .sdkDirectory.get().asFile
+                val compileSdk = project.extensions
+                    .getByType(com.android.build.api.dsl.CommonExtension::class.java)
+                    .compileSdk
+                val androidJar = sdkDir.resolve("platforms/android-$compileSdk/android.jar")
+                if (androidJar.exists()) {
+                    classpathArgs.add(androidJar.absolutePath)
+                }
+
+                // 3. Project's own compiled classes (Java + Kotlin)
+                for (taskName in listOf(javaCompileTaskName, kotlinCompileTaskName)) {
+                    val compileTask = project.tasks.findByName(taskName) ?: continue
+                    for (outputFile in compileTask.outputs.files) {
+                        // Skip non-directories (e.g. previous-compilation-data.bin)
+                        // and directories that contain no .class files (e.g. Kotlin
+                        // incremental caches, classpath snapshots, AP source outputs).
+                        if (outputFile.isDirectory &&
+                            outputFile.walkTopDown().any {
+                                it.isFile && it.extension == "class"
+                            }
+                        ) {
+                            classpathArgs.add(outputFile.absolutePath)
+                        }
+                    }
+                }
+
+                execBuildPython(ArrayList<String>().apply {
+                    args("-m", "chaquopy_stubgen")
+                    args("--output-dir", project.file(outputDir).absolutePath)
+                    args("--no-clean")
+                    val jvmPath = findJvmPath()
+                    args("--jvmpath", jvmPath.absolutePath)
+                    args(classpathArgs)
+                })
             }
         }
     }
@@ -586,6 +676,20 @@ internal class TaskBuilder(
 
     data class BuildPythonInfo(val commandLine: List<String>, val info: String)
 
+    fun findJvmPath(): File {
+        val javaHome = File(System.getProperty("java.home"))
+        val libName = when (osName()) {
+            "windows" -> "jvm.dll"
+            "mac"     -> "libjvm.dylib"
+            else      -> "libjvm.so"
+        }
+        return javaHome.walkTopDown().find { it.name == libName }
+            ?: throw GradleException(
+                "Could not find '$libName' under java.home ($javaHome). " +
+                "Please check your JDK installation."
+            )
+    }
+
     fun findBuildPython(): BuildPythonInfo {
         val version = python.version!!
         val bpSetting = python.buildPython
@@ -702,6 +806,15 @@ abstract class OutputDirTask : DefaultTask() {
     @TaskAction
     open fun run() {
         project.delete(outputDir)
+        project.mkdir(outputDir)
+    }
+}
+
+// Like OutputDirTask, but does NOT delete the output directory before running.
+// Used for the stubs task, which writes into the shared pip/common directory.
+abstract class StubsTask : OutputDirTask() {
+    @TaskAction
+    override fun run() {
         project.mkdir(outputDir)
     }
 }
